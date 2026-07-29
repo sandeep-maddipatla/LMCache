@@ -1264,6 +1264,7 @@ class TestPageableHostFallback:
         """A PinnedAllocFree whose alloc() raises, mimicking a pinned-alloc
         failure while leaving free() available.
         """
+        # First Party
         from lmcache.v1.memory_management import PinnedAllocFree
 
         def _boom():
@@ -1277,6 +1278,7 @@ class TestPageableHostFallback:
         )
 
     def test_plain_alloc_falls_back_to_pageable(self):
+        # First Party
         from lmcache.v1 import memory_management as mm
 
         size = 4096
@@ -1301,6 +1303,7 @@ class TestPageableHostFallback:
         assert buf.data_ptr() not in mm._FALLBACK_HOST_BUFFERS
 
     def test_free_of_fallback_does_not_touch_native_path(self):
+        # First Party
         from lmcache.v1 import memory_management as mm
 
         size = 2048
@@ -1333,6 +1336,7 @@ class TestPageableHostFallback:
         cannot preserve, so a pinned-alloc failure must propagate, not fall
         back.
         """
+        # First Party
         from lmcache.v1 import memory_management as mm
 
         with mock.patch.object(
