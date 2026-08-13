@@ -32,6 +32,43 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _is_fused_packed(engine_kv_format) -> bool:
+    """Return True for formats whose K/V pair is packed in the trailing dim."""
+    # First Party
+    from lmcache.v1.gpu_connector.kv_format.specs.registry import get_spec_class
+
+    return get_spec_class(engine_kv_format).is_fused_packed
+
+
+def _as_fused_plane(tensor: torch.Tensor, engine_kv_format) -> torch.Tensor:
+    """Present an LMCache-side ``[2, NL, T, D]`` buffer as ``[1, NL, T, 2 * D]``.
+
+    vLLM 0.27+ hands us one paged tensor per layer with K and V packed into the
+    trailing dim (``[num_blocks, block_size, num_heads, 2 * head_size]``), so a
+    layer's page is token-major with a per-token stride of ``num_heads * 2 *
+    head_size``. The kernel therefore moves it in a single pass and wants an
+    LMCache-side plane of the same per-token stride — the shape
+    ``KVLayerGroupsManager`` produces for the V3 connector. Handing it the split
+    ``[2, ...]`` shape instead would copy half the data at half the true stride.
+
+    This is a pure reinterpretation of the same contiguous storage, so the bytes
+    written are identical to the V3 fused buffer's: nothing is copied and D2H /
+    H2D stay each other's inverse. What the buffer is *not* is the split K-then-V
+    ordering ``MemoryFormat.KV_2LTD`` names, so a fused engine's memory objects
+    must not be fed to anything that reads their contents structurally (CacheGen
+    compression, blending) or shared with a non-fused engine.
+
+    Non-fused and MLA formats are returned unchanged.
+    """
+    if tensor.dim() != 4 or tensor.size(0) != 2:
+        return tensor
+    if not _is_fused_packed(engine_kv_format):
+        return tensor
+    # .view, not .reshape: a silent copy would break the D2H direction, which
+    # writes into this tensor.
+    return tensor.view(1, tensor.size(1), tensor.size(2), 2 * tensor.size(3))
+
+
 class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
     """
     The GPU KV cache should be a nested tuple of K and V tensors.
@@ -194,16 +231,18 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
+        # Keyword args from block_size on: passed positionally, the 9th argument
+        # lands in head_size and skip_prefix_n_tokens is silently dropped.
         lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
+            _as_fused_plane(memory_obj.tensor, self.engine_kv_format),
             kv_cache_pointers,
             slot_mapping[start:end],
             self.device,
             self.page_buffer_size,
             lmcache_native.TransferDirection.H2D,
             self.engine_kv_format,
-            self.block_size,
-            skip_prefix_n_tokens,
+            block_size=self.block_size,
+            skip_prefix_n_tokens=skip_prefix_n_tokens,
         )
 
     @_lmcache_nvtx_annotate
@@ -242,28 +281,28 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         with torch.xpu.stream(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
-                    memory_obj.tensor,
+                    _as_fused_plane(memory_obj.tensor, self.engine_kv_format),
                     kv_cache_pointers,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
                     self.page_buffer_size,
                     lmcache_native.TransferDirection.D2H,
                     self.engine_kv_format,
-                    self.block_size,
+                    block_size=self.block_size,
                 )
             else:
                 # kvcaches -> gpu_buffer -> memobj
                 assert self.gpu_buffer.device == self.kvcaches[0].device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
                 lmc_ops.multi_layer_kv_transfer(
-                    tmp_gpu_buffer,
+                    _as_fused_plane(tmp_gpu_buffer, self.engine_kv_format),
                     kv_cache_pointers,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
                     self.page_buffer_size,
                     lmcache_native.TransferDirection.D2H,
                     self.engine_kv_format,
-                    self.block_size,
+                    block_size=self.block_size,
                 )
                 memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
