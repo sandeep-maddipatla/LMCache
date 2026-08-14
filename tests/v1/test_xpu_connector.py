@@ -100,6 +100,8 @@ def patch_pin_allocator():
         lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
         # vLLM non-MLA flash infer
         lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS,
+        # vLLM 0.27+ unified KV cache: NHD with K/V fused into the trailing dim
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
     ],  # vllm MLA
 )
