@@ -14,6 +14,10 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.transfer_context.hybrid_engine_driven import (
+    gather_hybrid_paged_kv_to_cpu,
+    null_chunk_indices,
+)
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
@@ -230,7 +234,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     return completion
                 self._pending_stores.add(gather_launched)
 
-            full_block_ids = _single_group_block_ids(block_ids)
+            hybrid_layout = self._hybrid_layout if len(block_ids) > 1 else None
+            full_block_ids = (
+                block_ids[0]
+                if hybrid_layout is not None
+                else _single_group_block_ids(block_ids)
+            )
 
             def _prepare_gather_and_commit() -> None:
                 gather_done: Any | None = None
@@ -258,6 +267,20 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         if chunk_indices is not None
                         else len(full_block_ids) // blocks_in_chunk
                     )
+                    store_indices = (
+                        chunk_indices
+                        if chunk_indices is not None
+                        else list(range(num_chunks))
+                    )
+                    if hybrid_layout is not None:
+                        null_chunks = null_chunk_indices(
+                            block_ids, hybrid_layout, blocks_in_chunk, store_indices
+                        )
+                        if null_chunks:
+                            # Nothing is committed; the server expires the
+                            # reservation like any failed store.
+                            self._log_skipped_hybrid_store(_request_id, null_chunks)
+                            return
 
                     # Determine gather target:
                     # - SHM path (out_buffers available): gather into SHM views
@@ -286,15 +309,26 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
 
-                        gather_paged_kv_to_cpu(
-                            kv_caches,
-                            full_block_ids,
-                            blocks_in_chunk,
-                            layout_hints=self._layout_hints,
-                            engine_kv_format=self._engine_kv_format,
-                            out=gather_target,
-                            chunk_indices=chunk_indices,
-                        )
+                        if hybrid_layout is not None:
+                            gather_hybrid_paged_kv_to_cpu(
+                                kv_caches,
+                                block_ids,
+                                hybrid_layout,
+                                blocks_in_chunk,
+                                layout_hints=self._layout_hints,
+                                out=gather_target,
+                                chunk_indices=store_indices,
+                            )
+                        else:
+                            gather_paged_kv_to_cpu(
+                                kv_caches,
+                                full_block_ids,
+                                blocks_in_chunk,
+                                layout_hints=self._layout_hints,
+                                engine_kv_format=self._engine_kv_format,
+                                out=gather_target,
+                                chunk_indices=chunk_indices,
+                            )
 
                         gather_done = torch_dev.Event()
                         gather_done.record(self._copy_stream)

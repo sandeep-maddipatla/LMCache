@@ -209,6 +209,7 @@ It also computes `shm_pool_info` once from `StorageManagerConfig`:
 - `lmcache/v1/multiprocess/modules/server_transfer.py`: `TransferStrategy`, `PickleTransferStrategy`, `ShmTransferStrategy`
 - `lmcache/v1/multiprocess/transfer_context/worker_transfer.py`: `EngineDrivenTransferContext`, `LMCacheDrivenTransferContext`, `create_transfer_context`, `MPTransferMode`
 - `lmcache/v1/multiprocess/transfer_context/async_engine_driven.py`: `AsyncEngineDrivenTransferContext`
+- `lmcache/v1/multiprocess/transfer_context/hybrid_engine_driven.py`: `build_hybrid_layout`, `gather_hybrid_paged_kv_to_cpu`, `scatter_hybrid_cpu_to_paged_kv`, `null_chunk_indices` (see Section 4)
 - `lmcache/v1/multiprocess/transfer_context/base.py`: `EngineDrivenContext`, `gather_paged_kv_to_cpu`, `scatter_cpu_to_paged_kv`, `compute_kv_layout`
 - `lmcache/v1/multiprocess/transfer_context/pickle.py`: `EngineDrivenContextPickle`
 - `lmcache/v1/multiprocess/transfer_context/shm.py`: `EngineDrivenContextShm`
@@ -288,3 +289,67 @@ Retrieve:
 Notes:
 - SHM pool metadata is computed once in `MPCacheServerContext` init, not per registration.
 - `chunk_indices` optimization reduces unnecessary gather/copy work on partial cache hits.
+
+## 4. Hybrid (Multi Engine-Group) Models
+
+Hybrid models such as Qwen3.5 / Qwen3.6 / Qwen3.8 (Gated-DeltaNet + full
+attention) give vLLM several KV cache groups, each with its own paged block
+address space, so a request carries one block-id list per **engine group**.
+The engine-driven path stores one object per chunk holding **all** layers, so
+it moves each LMCache group's layers with that group's block ids
+(`hybrid_engine_driven.py`) and keeps the server format unchanged.
+
+**Registration** (`EngineDrivenTransferContext.register` → `build_hybrid_layout`)
+enables the hybrid path only for layouts it moves exactly; otherwise it logs
+"Hybrid engine-driven transfer disabled (...)" and multi-group stores and
+retrieves keep failing with "does not support hybrid KV cache groups":
+
+| Requirement | Why |
+|---|---|
+| ≥ 2 engine groups with dense ids `0..G-1` | block ids are indexed by engine group id |
+| every registered layer in exactly one group | each object holds every layer once |
+| one `tokens_per_block`, one detected block size and K/V plane count | a chunk spans the same blocks and tokens in every group |
+| no sliding-window group (a one-block window, `sw_size_tokens == tokens_per_block`, is how align-mode Mamba layers are reported and is allowed) | a sliding window drops blocks the object would need |
+
+Each LMCache group's KV format, dtype and per-token width are detected
+separately. If they all match, objects keep the engine dtype and width, exactly
+as for a single-group model. If not, the registered object is `uint8` and each
+layer's token row holds that layer's raw bytes, zero-padded to the widest group:
+
+```text
+vLLM 0.24 Qwen3.8-27B-FP8, TP=2: 4 groups, all bfloat16, 1024 B/token  -> bfloat16 objects
+vLLM 0.29 Qwen3.8-27B-FP8, TP=2: Mamba int8 1936 B/token,
+                                 attention bfloat16 2048 B/token       -> uint8 objects, 2048 B/token
+```
+
+**Store** gathers each group's layers with its own format and block ids, then
+assembles one full-layer chunk. Align-mode Mamba groups point every chunk except
+the one holding the latest recurrent state at the null block (id 0); such a
+chunk holds no valid state, and because object keys are content hashes,
+committing it would serve garbage to a later prefix hit. A store containing one
+is therefore skipped and reported as failed (first skip logs a WARNING, later
+ones DEBUG; the adapter also logs an error and publishes no store events). Null
+chunks come from scheduler steps that advance more than one block -- every chunk
+is stored only when each step advances one block, i.e.
+`--max-num-batched-tokens` in `[N, 2N)` for block size `N` -- and from a
+prefix-cache hit that re-sends chunks an earlier request stores, which loses
+nothing.
+
+**Retrieve** scatters each group's slice back to that group's blocks, in runs of
+consecutive chunks, never writing null blocks or chunks entirely inside the
+already-cached prefix.
+
+**Transport.** Hybrid support works on both transports, but restores move every
+layer of every chunk, which is large for long prompts (Qwen3.8-27B-FP8 at TP=2:
+~109 MB per 832-token chunk per rank). On the pickle transport the server clones,
+pickles and msgpack-encodes the whole restore: restores over `2**32 - 1` bytes
+cannot be encoded at all, and multi-GB restores can block the server long
+enough for workers to miss heartbeats. On vLLM versions without per-request load
+failure reporting, a failed multi-group load then stops the engine. Use the SHM
+transport for long prompts; it needs `--shm-name <name> --no-l1-use-lazy` (the
+lazy L1 allocator disables SHM) and `/dev/shm` space for the whole L1 pool:
+
+```bash
+lmcache server --chunk-size 832 --separate-object-groups --supported-transfer-mode auto \
+    --l1-size-gb 80 --shm-name lmcache_kv --no-l1-use-lazy
+```

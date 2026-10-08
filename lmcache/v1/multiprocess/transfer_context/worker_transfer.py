@@ -31,6 +31,13 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from lmcache.v1.multiprocess.transfer_context.hybrid_engine_driven import (
+    HybridLayout,
+    build_hybrid_layout,
+    gather_hybrid_paged_kv_to_cpu,
+    null_chunk_indices,
+    scatter_hybrid_cpu_to_paged_kv,
+)
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.event_ipc import (
@@ -778,6 +785,11 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        # Set only when register() found a hybrid layout it can move exactly.
+        self._hybrid_layout: HybridLayout | None = None
+        # True once a skipped hybrid store has been logged at WARNING; later
+        # skips are logged at DEBUG.
+        self._warned_skipped_hybrid_store = False
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -805,13 +817,18 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` and ``engine_type`` are accepted to satisfy
-        the base interface but are currently a no-op: the non-GPU transfer
-        path does not support hybrid KV cache groups and rejects multi-
-        group transfers at store / retrieve time (see
-        ``_single_group_block_ids``).
+        ``engine_group_infos`` enables hybrid (multi engine-group) transfers
+        when the layout qualifies (see
+        :func:`~lmcache.v1.multiprocess.transfer_context.hybrid_engine_driven.build_hybrid_layout`),
+        which then also sets the registered object dtype and width;
+        otherwise multi-group transfers are rejected at store / retrieve time
+        (see ``_single_group_block_ids``). ``engine_type`` is accepted to
+        satisfy the base interface and is unused.
         """
         del engine_type  # unused on the engine-driven path
+        self._hybrid_layout = build_hybrid_layout(
+            engine_group_infos, kv_caches, layout_hints
+        )
         # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
         # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
         # on the CUDA path. The non-CUDA path is yet to be implemented.
@@ -825,6 +842,10 @@ class EngineDrivenTransferContext(TransferContext):
         ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
         self._layout_hints = layout_hints
         self._engine_kv_format = engine_kv_format
+        if self._hybrid_layout is not None:
+            # The first layer's dtype and width need not fit the other groups.
+            hidden_dim_size = self._hybrid_layout.object_hidden_dim
+            dtype_str = str(self._hybrid_layout.object_dtype).replace("torch.", "")
 
         # The wire field is named use_mla but only drives the object plane
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
@@ -935,15 +956,41 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
+        if len(block_ids) > 1 and self._hybrid_layout is not None:
+            store_indices = (
+                chunk_indices
+                if chunk_indices is not None
+                else list(range(len(block_ids[0]) // blocks_in_chunk))
+            )
+            null_chunks = null_chunk_indices(
+                block_ids, self._hybrid_layout, blocks_in_chunk, store_indices
+            )
+            if null_chunks:
+                # Nothing is committed; the server expires the reservation like
+                # any failed store.
+                self._log_skipped_hybrid_store(_request_id, null_chunks)
+                future = MessagingFuture()
+                future.set_result(False)
+                return future
+            cpu_chunks = gather_hybrid_paged_kv_to_cpu(
+                kv_caches,
+                block_ids,
+                self._hybrid_layout,
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
+        else:
+            cpu_chunks = gather_paged_kv_to_cpu(
+                kv_caches,
+                _single_group_block_ids(block_ids),
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
         # Gather issues async device->CPU copies on BOTH transports: into the
         # SHM slots when out_buffers is given, otherwise into fresh buffers that
         # commit_store serializes immediately. Either way the copies must be
@@ -980,15 +1027,26 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
-                )
+                if len(block_ids) > 1 and self._hybrid_layout is not None:
+                    scatter_hybrid_cpu_to_paged_kv(
+                        kv_caches,
+                        block_ids,
+                        self._hybrid_layout,
+                        src_buffers,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                    )
+                else:
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        _single_group_block_ids(block_ids),
+                        src_buffers,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
@@ -1009,6 +1067,40 @@ class EngineDrivenTransferContext(TransferContext):
 
     def flush_inflight_stores(self) -> None:
         pass
+
+    def _log_skipped_hybrid_store(
+        self, request_id: str, null_chunks: list[int]
+    ) -> None:
+        """Log a hybrid store skipped for null chunks; warn on the first one.
+
+        Each object holds every layer of a chunk, so a chunk without valid
+        recurrent state cannot be stored. In align mode that is every chunk a
+        scheduler step crosses before its last block, and the earlier chunks
+        of a prefix-cache hit (only the latest state block is kept). The
+        skipped store is reported as failed, so the adapter logs an error for
+        it and publishes no store events.
+        """
+        if self._warned_skipped_hybrid_store:
+            logger.debug(
+                "Skipping hybrid store for request_id=%s: chunks %s hold no "
+                "valid KV in at least one engine group",
+                request_id,
+                null_chunks,
+            )
+            return
+        self._warned_skipped_hybrid_store = True
+        logger.warning(
+            "Skipping hybrid store for request_id=%s: chunks %s hold no valid "
+            "KV in at least one engine group (e.g. no Mamba state), and the "
+            "engine-driven path stores all layers of a chunk together. Such "
+            "chunks come from a scheduler step that advances more than one KV "
+            "block (keep --max-num-batched-tokens below twice the block size "
+            "to store every chunk) or from a prefix-cache hit re-sending "
+            "chunks that an earlier request stores. The store is reported as "
+            "failed. Further skips are logged at DEBUG.",
+            request_id,
+            null_chunks,
+        )
 
 
 def create_transfer_context(
