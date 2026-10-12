@@ -16,6 +16,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.custom_types import (
     PrepareRetrieveResponse,
     PrepareStoreResponse,
@@ -1414,6 +1415,8 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     no new objects and returns empty slots (``{"slots": [], "chunk_indices": []}``).
     The worker sees an empty chunk_indices list, skips gather and commit entirely,
     so no entry leaks in ``_pending_shm_writes`` and no spurious error is logged.
+    Because nothing transfers, the store must also publish no transfer events:
+    a START here would never be matched by an END.
     """
     mock_storage = MagicMock()
     # Empty reserve_write indicates all object keys already exist in cache.
@@ -1421,7 +1424,7 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h"]
 
-    module, _, _, _ = server_module_factory(
+    module, _, _, ctx = server_module_factory(
         storage_manager_config=_make_storage_manager_config(
             shm_name="lmcache_test_pool", pool_size=1024
         ),
@@ -1435,6 +1438,12 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     prepare_response = module.prepare_store(key, 3)
     # Server signals all-cached via empty slots list (not missing "slots" key).
     assert prepare_response.context == {"slots": [], "chunk_indices": []}
+
+    published = [
+        call.args[0].event_type for call in ctx.event_bus.publish.call_args_list
+    ]
+    assert EventType.MP_STORE_SUBMITTED not in published
+    assert EventType.MP_STORE_START not in published
 
     # commit_store without a matching prepare must fail (no entry leaked).
     assert module.commit_store(key, 3, b"") is False

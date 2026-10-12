@@ -872,6 +872,7 @@ class EngineDrivenTransferContext(TransferContext):
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
                     num_physical_slots=blocks_in_chunk * block_size,
+                    device=str(_get_kv_device(kv_caches)),
                 )
             )
         )
