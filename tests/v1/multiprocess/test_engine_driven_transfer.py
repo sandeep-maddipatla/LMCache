@@ -3,7 +3,7 @@
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 from unittest.mock import MagicMock, PropertyMock, patch
 import os
 import pickle
@@ -1440,7 +1440,8 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     assert prepare_response.context == {"slots": [], "chunk_indices": []}
 
     published = [
-        call.args[0].event_type for call in ctx.event_bus.publish.call_args_list
+        call.args[0].event_type
+        for call in cast(MagicMock, ctx.event_bus.publish).call_args_list
     ]
     assert EventType.MP_STORE_SUBMITTED not in published
     assert EventType.MP_STORE_START not in published
