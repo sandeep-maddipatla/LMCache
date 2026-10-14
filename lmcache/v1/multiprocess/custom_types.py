@@ -167,6 +167,10 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         num_physical_slots: Number of physical KV slots gathered into one
             LMCache chunk. ``None`` accepts the legacy protocol, where the
             server assumed one physical slot per logical token.
+        device: The worker's KV cache device (e.g. ``"xpu:0"``), used only as
+            the metric and trace label that distinguishes this worker's
+            transfers from its peers'. ``None`` accepts the legacy protocol,
+            where the server labels them by instance id instead.
     """
 
     instance_id: int
@@ -178,6 +182,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     dtype_str: str
     use_mla: bool
     num_physical_slots: int | None = None
+    device: str | None = None
 
 
 @dataclass

@@ -54,6 +54,8 @@ def _bare_non_gpu_module() -> EngineDrivenTransferModule:
     module._pending_shm_writes = {}
     module._pending_shm_reads = {}
     module._pending_shm_lock = threading.Lock()
+    module._transfer_starts = {}
+    module._transfer_starts_lock = threading.Lock()
     return module
 
 
@@ -162,11 +164,11 @@ def test_non_gpu_reap_pops_strategy_as_pair() -> None:
     module = _bare_non_gpu_module()
     old = time.monotonic() - 1000.0
     module._engine_driven_contexts[1] = non_gpu_mod.EngineDrivenContextEntry(
-        MagicMock(), "m", 1, old, True
+        MagicMock(), "m", 1, "xpu:0", 1024, last_seen=old, has_liveness_signal=True
     )
     module._strategies[1] = MagicMock()
     module._engine_driven_contexts[2] = non_gpu_mod.EngineDrivenContextEntry(
-        MagicMock(), "m", 1, old, False
+        MagicMock(), "m", 1, "xpu:1", 1024, last_seen=old, has_liveness_signal=False
     )
     module._strategies[2] = MagicMock()
 
@@ -182,7 +184,7 @@ def test_non_gpu_resolve_for_transfer_refreshes_and_raises() -> None:
     last_seen; an unknown id raises ValueError."""
     module = _bare_non_gpu_module()
     module._engine_driven_contexts[1] = non_gpu_mod.EngineDrivenContextEntry(
-        MagicMock(), "m", 1, 0.0, False
+        MagicMock(), "m", 1, "xpu:0", 1024, last_seen=0.0, has_liveness_signal=False
     )
     strategy = MagicMock()
     module._strategies[1] = strategy

@@ -16,6 +16,7 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     PrepareRetrieveResponse,
@@ -45,6 +46,11 @@ class EngineDrivenContextEntry:
         metadata: Layout metadata describing the non-CUDA chunk format.
         model_name: The name of the model associated with this context.
         world_size: The world size associated with this context.
+        device: Label identifying the worker's KV cache device, used to
+            correlate and label its transfer events. Falls back to the
+            instance id for clients that do not report a device.
+        chunk_bytes: Size of one registered chunk object in bytes, the amount
+            moved per chunk in one direction.
         last_seen: ``time.monotonic()`` of the most recent activity from this
             instance (register, PING, prepare/commit). Drives reaping.
         has_liveness_signal: True once the instance has sent at least one
@@ -54,6 +60,8 @@ class EngineDrivenContextEntry:
     metadata: EngineDrivenContextMetadata
     model_name: str
     world_size: int
+    device: str
+    chunk_bytes: int
     last_seen: float = 0.0
     has_liveness_signal: bool = False
 
@@ -84,6 +92,17 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             tuple[int, IPCCacheServerKey], list[ObjectKey]
         ] = {}
         self._pending_shm_lock = threading.Lock()
+        # ("store"|"retrieve", instance_id, key) -> (start time, prepared chunks).
+        # Keyed per transfer, not per request: every rank of a tensor-parallel
+        # worker transfers under one request_id, and a rank can have several of
+        # its chunks in flight, so a coarser key loses durations. An entry is
+        # recorded only when the worker is expected to commit, so each one is
+        # popped by its commit; what a worker abandons mid-transfer is swept with
+        # the instance. Leaf lock, never held with _lock.
+        self._transfer_starts: dict[
+            tuple[str, int, IPCCacheServerKey], tuple[float, int | None]
+        ] = {}
+        self._transfer_starts_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
 
     @property
@@ -225,6 +244,10 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id: The popped instance ID.
             entry: The popped entry.
         """
+        with self._transfer_starts_lock:
+            for state_key in [k for k in self._transfer_starts if k[1] == instance_id]:
+                del self._transfer_starts[state_key]
+
         with self._pending_shm_lock:
             stale_writes = [k for k in self._pending_shm_writes if k[0] == instance_id]
             stale_reads = [k for k in self._pending_shm_reads if k[0] == instance_id]
@@ -250,6 +273,113 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         """Resolve object keys for the single object group used by
         non-GPU transfers."""
         return self._ctx.resolve_obj_keys(key, [0])[0]
+
+    def _publish_transfer_event(
+        self,
+        event_type: EventType,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        entry: EngineDrivenContextEntry,
+        **metadata: object,
+    ) -> None:
+        """Publish one engine-driven transfer event.
+
+        The START / END pair brackets the server's view of a transfer: the
+        worker drives the device copies between ``prepare_*`` and
+        ``commit_*``, so that window covers its copy plus the transport, and
+        is what the matching log line reports. Each rank of a tensor-parallel
+        worker reports its own ``device``, so a consumer can tell their
+        transfers of one request apart. The END events also carry the
+        server-measured ``duration_seconds``: several chunks of one request
+        can be in flight on one rank, so a consumer must not infer a
+        transfer's duration by pairing timestamps per request and device.
+
+        Args:
+            event_type: The ``MP_STORE_*`` / ``MP_RETRIEVE_*`` type to publish.
+            key: Cache key of the transfer.
+            instance_id: Worker instance identifier.
+            entry: The worker's registered context.
+            metadata: Event-type specific fields merged into the metadata,
+                e.g. ``total_bytes`` and ``num_tokens`` on the END events.
+                Fields passed as ``None`` are omitted, so consumers see an
+                absent field rather than a null one.
+        """
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=event_type,
+                session_id=key.request_id,
+                metadata={
+                    "device": entry.device,
+                    "engine_id": instance_id,
+                    "model_name": entry.model_name,
+                    **{k: v for k, v in metadata.items() if v is not None},
+                },
+            )
+        )
+
+    def _begin_transfer(
+        self,
+        phase: str,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        prepared_chunks: int | None,
+    ) -> None:
+        """Record the start of one prepared transfer.
+
+        Args:
+            phase: ``"store"`` or ``"retrieve"``.
+            key: Cache key of the transfer.
+            instance_id: Worker instance identifier.
+            prepared_chunks: Chunks the transfer will move, or ``None`` when
+                the strategy does not report a count.
+        """
+        with self._transfer_starts_lock:
+            self._transfer_starts[(phase, instance_id, key)] = (
+                time.perf_counter(),
+                prepared_chunks,
+            )
+
+    def _finish_transfer(
+        self, phase: str, key: IPCCacheServerKey, instance_id: int
+    ) -> tuple[float | None, int | None]:
+        """Close one transfer and return what it took.
+
+        Args:
+            phase: ``"store"`` or ``"retrieve"``.
+            key: Cache key of the transfer.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            ``(elapsed_seconds, prepared_chunks)``, both ``None`` when the
+            transfer has no recorded start (its instance was reaped, or the
+            commit arrived without a prepare).
+        """
+        with self._transfer_starts_lock:
+            state = self._transfer_starts.pop((phase, instance_id, key), None)
+        if state is None:
+            return None, None
+        start, prepared_chunks = state
+        return time.perf_counter() - start, prepared_chunks
+
+    @staticmethod
+    def _prepared_chunk_count(context: dict, field: str) -> int | None:
+        """Return how many chunks the prepared transfer will move.
+
+        The SHM strategy reserves only the chunks that still need the
+        transfer and reports them in its response context; the pickle
+        strategy moves every object key, which the caller counts instead.
+
+        Args:
+            context: ``PrepareStoreResponse`` / ``PrepareRetrieveResponse``
+                context.
+            field: Context field listing the prepared chunks (``chunk_indices``
+                for a store, ``slots`` for a retrieve).
+
+        Returns:
+            The chunk count, or ``None`` when the strategy does not report one.
+        """
+        prepared = context.get(field)
+        return len(prepared) if prepared is not None else None
 
     @request_handler()
     def register_kv_cache_engine_driven_context(
@@ -323,6 +453,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             metadata=metadata,
             model_name=payload.model_name,
             world_size=payload.world_size,
+            device=payload.device or f"instance:{payload.instance_id}",
+            chunk_bytes=shape.numel() * dtype.itemsize,
             last_seen=now,
             has_liveness_signal=False,
         )
@@ -400,8 +532,17 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
-        session = self._ctx.session_manager.get_or_create(key.request_id)
-        session.extras["store_start_time"] = time.perf_counter()
+        prepared = self._prepared_chunk_count(response.context, "chunk_indices")
+        if prepared == 0:
+            # Every chunk is already cached, so the strategy reserved nothing and
+            # the worker returns without committing. Recording a start here would
+            # leave an entry no commit ever pops.
+            return response
+        self._begin_transfer("store", key, instance_id, prepared)
+        self._publish_transfer_event(
+            EventType.MP_STORE_SUBMITTED, key, instance_id, entry
+        )
+        self._publish_transfer_event(EventType.MP_STORE_START, key, instance_id, entry)
         return response
 
     @request_handler(
@@ -430,8 +571,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 instance ID.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        session = self._ctx.session_manager.get_or_create(key.request_id)
-        st = session.extras.pop("store_start_time", None)
+        elapsed, prepared = self._finish_transfer("store", key, instance_id)
         result = strategy.commit_store(
             key=key,
             instance_id=instance_id,
@@ -439,14 +579,28 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
-        if st is not None and result:
-            num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
+        stored_count = 0
+        if result:
+            stored_count = (
+                prepared
+                if prepared is not None
+                else len(self._resolve_single_group_obj_keys(key))
             )
+        self._publish_transfer_event(
+            EventType.MP_STORE_END,
+            key,
+            instance_id,
+            entry,
+            stored_count=stored_count,
+            total_bytes=stored_count * entry.chunk_bytes,
+            num_tokens=stored_count * self._ctx.chunk_size,
+            duration_seconds=elapsed,
+        )
+        if elapsed is not None and result:
             logger.info(
                 "Stored %d tokens in %.3f seconds",
-                num_tokens,
-                time.perf_counter() - st,
+                stored_count * self._ctx.chunk_size,
+                elapsed,
             )
         return result
 
@@ -473,14 +627,26 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
-        session = self._ctx.session_manager.get_or_create(key.request_id)
-        session.extras["retrieve_start_time"] = time.perf_counter()
+        self._begin_transfer(
+            "retrieve",
+            key,
+            instance_id,
+            self._prepared_chunk_count(response.context, "slots")
+            if response.success
+            else 0,
+        )
+        self._publish_transfer_event(
+            EventType.MP_RETRIEVE_SUBMITTED, key, instance_id, entry
+        )
+        self._publish_transfer_event(
+            EventType.MP_RETRIEVE_START, key, instance_id, entry
+        )
         return response
 
     @request_handler(
@@ -502,17 +668,29 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             Always ``True``.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
-        session = self._ctx.session_manager.get_or_create(key.request_id)
-        st = session.extras.pop("retrieve_start_time", None)
+        entry, strategy = self._resolve_for_transfer(instance_id)
+        elapsed, prepared = self._finish_transfer("retrieve", key, instance_id)
         result = strategy.commit_retrieve(key=key, instance_id=instance_id)
-        if st is not None:
-            num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
-            )
+        retrieved_count = (
+            prepared
+            if prepared is not None
+            else len(self._resolve_single_group_obj_keys(key))
+        )
+        self._publish_transfer_event(
+            EventType.MP_RETRIEVE_END,
+            key,
+            instance_id,
+            entry,
+            retrieved_count=retrieved_count,
+            cache_salt=key.cache_salt,
+            total_bytes=retrieved_count * entry.chunk_bytes,
+            num_tokens=retrieved_count * self._ctx.chunk_size,
+            duration_seconds=elapsed,
+        )
+        if elapsed is not None:
             logger.info(
                 "Retrieved %d tokens in %.3f seconds",
-                num_tokens,
-                time.perf_counter() - st,
+                retrieved_count * self._ctx.chunk_size,
+                elapsed,
             )
         return result
