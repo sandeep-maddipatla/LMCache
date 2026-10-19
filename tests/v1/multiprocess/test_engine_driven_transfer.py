@@ -1450,6 +1450,153 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     assert module.commit_store(key, 3, b"") is False
 
 
+def _store_end_durations(ctx: Any) -> list[float | None]:
+    """Reported ``duration_seconds`` of every MP_STORE_END the module published.
+
+    ``_publish_transfer_event`` omits fields that are ``None``, so a commit
+    that found no recorded start shows up here as a missing duration.
+    """
+    # First Party
+    from lmcache.v1.mp_observability.event import EventType
+
+    return [
+        call.args[0].metadata.get("duration_seconds")
+        for call in cast(MagicMock, ctx.event_bus.publish).call_args_list
+        if call.args[0].event_type is EventType.MP_STORE_END
+    ]
+
+
+def test_concurrent_same_content_stores_are_timed_independently(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Two in-flight requests over the same token range must both be timed.
+
+    ``IPCCacheServerKey`` excludes ``request_id`` from equality by design, so
+    timing state keyed on content alone would collide: the second prepare would
+    overwrite the first's start and the first commit would consume the
+    replacement, leaving the second commit with no duration to report.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+    module, _, _, ctx = server_module_factory(mock_session=mock_session)
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=7)
+    )
+    key_a, key_b = (
+        IPCCacheServerKey.from_token_ids(
+            "m", 1, 0, [1] * 8, start=0, end=8, request_id=rid
+        )
+        for rid in ("req-a", "req-b")
+    )
+    # Equal as cache identities, distinct as transfers.
+    assert key_a == key_b
+
+    # Both prepares are outstanding before either commits.
+    chunk = pickle.dumps([torch.ones(2, 2, 8, 16)])
+    module.prepare_store(key_a, 7)
+    module.prepare_store(key_b, 7)
+    module.commit_store(key_a, 7, chunk)
+    module.commit_store(key_b, 7, chunk)
+
+    durations = _store_end_durations(ctx)
+    assert len(durations) == 2
+    assert all(d is not None for d in durations)
+
+
+def test_abandoned_prepares_do_not_grow_without_bound(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A prepared store that never commits must not retain state forever.
+
+    A hybrid store that finds a null chunk returns without committing, and a
+    live worker is never reaped, so these entries would otherwise accumulate
+    for the process lifetime -- one per request_id once the key distinguishes
+    requests.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+    from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
+        _MAX_TRACKED_TRANSFERS,
+    )
+
+    module, _, _, _ = server_module_factory()
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=11)
+    )
+    for i in range(_MAX_TRACKED_TRANSFERS + 500):
+        module.prepare_store(
+            IPCCacheServerKey.from_token_ids(
+                "m", 1, 0, [1] * 8, start=0, end=8, request_id=f"req-{i}"
+            ),
+            11,
+        )
+    assert len(module._transfer_starts) <= _MAX_TRACKED_TRANSFERS
+
+
+def test_partial_store_reports_no_count_when_its_timing_entry_was_evicted(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """An untracked commit must not report the whole range as newly stored.
+
+    The tracking cap evicts the oldest entry, which can belong to a live
+    transfer. An SHM store reserves only the chunks that were missing, so
+    falling back to counting every chunk in the requested range would report
+    already-cached chunks as newly stored, inflating counts, bytes and tokens.
+    """
+    # First Party
+    from lmcache.v1.mp_observability.event import EventType
+    from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 1, 8, 16)
+    memory_obj.shm_offset = 0
+    memory_obj.shm_byte_length = memory_obj.tensor.numel() * 4
+    # Two chunks requested, one already cached: only the second is reserved,
+    # so exactly one chunk is newly stored.
+    mock_storage.reserve_write.side_effect = lambda obj_keys, *_a, **_k: {
+        obj_key: memory_obj for obj_key in list(obj_keys)[1:]
+    }
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h0", b"h1"]
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=4096
+        ),
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+        object_keys=["obj-0", "obj-1"],
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=5)
+    )
+    key = IPCCacheServerKey.from_token_ids(
+        "m", 1, 0, [1] * 8, start=0, end=8, request_id="req-partial"
+    )
+    prepare_response = module.prepare_store(key, 5)
+    # A genuine partial store: 2 chunks requested, 1 reserved.
+    assert prepare_response.context["chunk_indices"] == [1]
+    # Drop the entry the way the cap would, then commit as the worker does.
+    module._transfer_starts.clear()
+    module.commit_store(key, 5, b"")
+
+    ends = [
+        call.args[0]
+        for call in cast(MagicMock, ctx.event_bus.publish).call_args_list
+        if call.args[0].event_type is EventType.MP_STORE_END
+    ]
+    assert len(ends) == 1
+    # Completion is still published, but no fabricated measurements.
+    for field in ("stored_count", "total_bytes", "num_tokens", "duration_seconds"):
+        assert field not in ends[0].metadata, field
+
+
 def test_server_prepare_store_releases_unused_reserved_write_locks(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,

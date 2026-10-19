@@ -37,6 +37,12 @@ from .server_transfer import (
 
 logger = init_logger(__name__)
 
+# In-flight prepare->commit timings tracked per server. A prepared transfer is
+# not guaranteed to commit, so this is a cap rather than a precise bound: it
+# sits far above the transfers a deployment can have genuinely in flight
+# (workers x ranks x chunks), so eviction only ever discards abandoned entries.
+_MAX_TRACKED_TRANSFERS = 4096
+
 
 @dataclass
 class EngineDrivenContextEntry:
@@ -92,15 +98,31 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             tuple[int, IPCCacheServerKey], list[ObjectKey]
         ] = {}
         self._pending_shm_lock = threading.Lock()
-        # ("store"|"retrieve", instance_id, key) -> (start time, prepared chunks).
-        # Keyed per transfer, not per request: every rank of a tensor-parallel
-        # worker transfers under one request_id, and a rank can have several of
-        # its chunks in flight, so a coarser key loses durations. An entry is
-        # recorded only when the worker is expected to commit, so each one is
-        # popped by its commit; what a worker abandons mid-transfer is swept with
-        # the instance. Leaf lock, never held with _lock.
+        # ("store"|"retrieve", instance_id, request_id, key hash) -> (start,
+        # chunks). Keyed per transfer, not per request: every rank of a
+        # tensor-parallel worker transfers under one request_id, and a rank can
+        # have several of its chunks in flight, so a coarser key loses
+        # durations. request_id is carried separately because
+        # IPCCacheServerKey excludes it from equality by design, so two
+        # concurrent requests over the same token range would otherwise share
+        # one entry: the second prepare would overwrite the first's start and
+        # the first commit would consume the replacement.
+        #
+        # The key holds the cache key's hash rather than the key itself so an
+        # entry costs a few words instead of the request's whole token tuple.
+        # A hash clash within one phase, instance and request_id would mis-time
+        # one sample; nothing else reads this state.
+        #
+        # Bounded, because a prepared transfer is not guaranteed to commit: a
+        # hybrid store that finds a null chunk returns without committing
+        # (worker_transfer._log_skipped_hybrid_store), and a live worker is
+        # never reaped, so its abandoned entries would otherwise accumulate for
+        # the process lifetime. Insertion order is start order, so the oldest
+        # entry is the front one; over the cap the oldest loses its timing
+        # sample, which degrades a metric instead of leaking. Leaf lock, never
+        # held with _lock.
         self._transfer_starts: dict[
-            tuple[str, int, IPCCacheServerKey], tuple[float, int | None]
+            tuple[str, int, str, int], tuple[float, int | None]
         ] = {}
         self._transfer_starts_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
@@ -334,14 +356,16 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 the strategy does not report a count.
         """
         with self._transfer_starts_lock:
-            self._transfer_starts[(phase, instance_id, key)] = (
+            while len(self._transfer_starts) >= _MAX_TRACKED_TRANSFERS:
+                self._transfer_starts.pop(next(iter(self._transfer_starts)))
+            self._transfer_starts[(phase, instance_id, key.request_id, hash(key))] = (
                 time.perf_counter(),
                 prepared_chunks,
             )
 
     def _finish_transfer(
         self, phase: str, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[float | None, int | None]:
+    ) -> tuple[float, int | None] | None:
         """Close one transfer and return what it took.
 
         Args:
@@ -350,16 +374,58 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id: Worker instance identifier.
 
         Returns:
-            ``(elapsed_seconds, prepared_chunks)``, both ``None`` when the
-            transfer has no recorded start (its instance was reaped, or the
-            commit arrived without a prepare).
+            ``(elapsed_seconds, prepared_chunks)``, or ``None`` when the
+            transfer has no recorded start: its instance was reaped, the commit
+            arrived without a prepare, or the entry was evicted under the
+            tracking cap. ``prepared_chunks`` is ``None`` within a found entry
+            when the strategy does not report a count, which is a different
+            thing from the transfer being untracked -- callers must not
+            conflate them, because the whole requested range is the right
+            count only in the former case.
         """
         with self._transfer_starts_lock:
-            state = self._transfer_starts.pop((phase, instance_id, key), None)
+            state = self._transfer_starts.pop(
+                (phase, instance_id, key.request_id, hash(key)), None
+            )
         if state is None:
-            return None, None
+            return None
         start, prepared_chunks = state
         return time.perf_counter() - start, prepared_chunks
+
+    def _committed_count(
+        self,
+        timing: tuple[float, int | None] | None,
+        key: IPCCacheServerKey,
+        moved: bool,
+    ) -> tuple[float | None, int | None]:
+        """Resolve what a finished transfer moved, or ``None`` if unknowable.
+
+        The whole requested range is the right count only when the transfer
+        was tracked and its strategy reported no narrower one -- the pickle
+        strategy moves every object key. An untracked transfer (reaped,
+        unprepared, or evicted under the tracking cap) carries no such
+        guarantee: an SHM store reserves only the chunks that were missing, so
+        counting the range would report cached chunks as newly stored. Report
+        nothing rather than something wrong; the completion event is still
+        published so consumers see the transfer finish.
+
+        Args:
+            timing: Result of :meth:`_finish_transfer`.
+            key: Cache key of the transfer.
+            moved: Whether the transfer actually moved data.
+
+        Returns:
+            ``(elapsed_seconds, chunk_count)``. Either element is ``None``
+            when it cannot be determined.
+        """
+        if timing is None:
+            return None, None
+        elapsed, prepared = timing
+        if not moved:
+            return elapsed, 0
+        if prepared is not None:
+            return elapsed, prepared
+        return elapsed, len(self._resolve_single_group_obj_keys(key))
 
     @staticmethod
     def _prepared_chunk_count(context: dict, field: str) -> int | None:
@@ -571,7 +637,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 instance ID.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        elapsed, prepared = self._finish_transfer("store", key, instance_id)
+        timing = self._finish_transfer("store", key, instance_id)
         result = strategy.commit_store(
             key=key,
             instance_id=instance_id,
@@ -579,24 +645,22 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
-        stored_count = 0
-        if result:
-            stored_count = (
-                prepared
-                if prepared is not None
-                else len(self._resolve_single_group_obj_keys(key))
-            )
+        elapsed, stored_count = self._committed_count(timing, key, moved=result)
         self._publish_transfer_event(
             EventType.MP_STORE_END,
             key,
             instance_id,
             entry,
             stored_count=stored_count,
-            total_bytes=stored_count * entry.chunk_bytes,
-            num_tokens=stored_count * self._ctx.chunk_size,
+            total_bytes=None
+            if stored_count is None
+            else stored_count * entry.chunk_bytes,
+            num_tokens=None
+            if stored_count is None
+            else stored_count * self._ctx.chunk_size,
             duration_seconds=elapsed,
         )
-        if elapsed is not None and result:
+        if elapsed is not None and stored_count is not None and result:
             logger.info(
                 "Stored %d tokens in %.3f seconds",
                 stored_count * self._ctx.chunk_size,
@@ -669,13 +733,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             Always ``True``.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        elapsed, prepared = self._finish_transfer("retrieve", key, instance_id)
+        timing = self._finish_transfer("retrieve", key, instance_id)
         result = strategy.commit_retrieve(key=key, instance_id=instance_id)
-        retrieved_count = (
-            prepared
-            if prepared is not None
-            else len(self._resolve_single_group_obj_keys(key))
-        )
+        elapsed, retrieved_count = self._committed_count(timing, key, moved=True)
         self._publish_transfer_event(
             EventType.MP_RETRIEVE_END,
             key,
@@ -683,11 +743,15 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             entry,
             retrieved_count=retrieved_count,
             cache_salt=key.cache_salt,
-            total_bytes=retrieved_count * entry.chunk_bytes,
-            num_tokens=retrieved_count * self._ctx.chunk_size,
+            total_bytes=None
+            if retrieved_count is None
+            else retrieved_count * entry.chunk_bytes,
+            num_tokens=None
+            if retrieved_count is None
+            else retrieved_count * self._ctx.chunk_size,
             duration_seconds=elapsed,
         )
-        if elapsed is not None:
+        if elapsed is not None and retrieved_count is not None:
             logger.info(
                 "Retrieved %d tokens in %.3f seconds",
                 retrieved_count * self._ctx.chunk_size,
