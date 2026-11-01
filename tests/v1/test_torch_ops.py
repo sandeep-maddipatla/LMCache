@@ -1374,6 +1374,133 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
         results[f"multi_layer_kv_transfer_{dir_tag}"] = key_value.cpu()
 
     results.update(fused_results)
+
+    # ── 5c. HND formats (head-major pages) ──
+    # An HND page keeps each head's tokens contiguous, so a token's scalars sit
+    # block_size rows apart per head. The kernel needs head_size to split the
+    # flat per-token scalars into (head, head_offset); the fused format packs
+    # K/V into a head row of 2 * head_size, the split ones use head_size.
+    hnd_heads = 2
+    hnd_hs = 8
+    hnd_blocks = page_buffer_size // block_size
+    hnd_results: dict[str, torch.Tensor] = {}
+    for hnd_name, hnd_fmt, hnd_kv, hnd_two_major in (
+        ("cs", lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS, 1, False),
+        ("flash_attn", lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS, 2, True),
+        ("flash_infer", lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS, 2, False),
+    ):
+        row = 2 * hnd_hs if hnd_kv == 1 else hnd_hs
+        hnd_hidden = hnd_heads * row
+        if hnd_kv == 1:
+            hnd_shape = (hnd_blocks, hnd_heads, block_size, row)
+        elif hnd_two_major:
+            hnd_shape = (2, hnd_blocks, hnd_heads, block_size, row)
+        else:
+            hnd_shape = (hnd_blocks, 2, hnd_heads, block_size, row)
+
+        def token_vec(pb, k, slot):
+            """One token's (head, row) scalars from an HND page, flattened."""
+            b, o = slot // block_size, slot % block_size
+            if hnd_kv == 1:
+                return pb[b, :, o, :].reshape(-1)
+            if hnd_two_major:
+                return pb[k, b, :, o, :].reshape(-1)
+            return pb[b, k, :, o, :].reshape(-1)
+
+        for direction in [True, False]:
+            dir_tag = "paged2lmc" if direction else "lmc2paged"
+            key_value = torch.zeros(
+                (hnd_kv, num_layers, num_tokens, hnd_hidden), dtype=dtype, device="cpu"
+            )
+            if device in ("cuda", "xpu"):
+                key_value = key_value.pin_memory()
+            if not direction:
+                for k in range(hnd_kv):
+                    for ly in range(num_layers):
+                        for t in range(num_tokens):
+                            key_value[k, ly, t] = (
+                                k * 5000 + ly * 1000 + t * 10 + torch.arange(hnd_hidden)
+                            ).to(dtype)
+
+            page_buffers = []
+            for ly in range(num_layers):
+                pb = torch.zeros(hnd_shape, dtype=dtype, device=device)
+                if direction:
+                    # Distinct value per (k, slot, head, offset) so any head or
+                    # token mix-up changes the compared bytes.
+                    for k in range(hnd_kv):
+                        for s_ in range(page_buffer_size):
+                            base = k * 5000 + ly * 2000 + s_ * 10
+                            val = (base + torch.arange(hnd_hidden)).to(dtype)
+                            b_, o_ = s_ // block_size, s_ % block_size
+                            val = val.reshape(hnd_heads, row).to(device)
+                            if hnd_kv == 1:
+                                pb[b_, :, o_, :] = val
+                            elif hnd_two_major:
+                                pb[k, b_, :, o_, :] = val
+                            else:
+                                pb[b_, k, :, o_, :] = val
+                page_buffers.append(pb)
+
+            if use_tensor_list:
+                key_value_ptrs = page_buffers
+            else:
+                key_value_ptrs = torch.tensor(
+                    [pb.data_ptr() for pb in page_buffers],
+                    dtype=torch.uint64,
+                    device=device,
+                )
+            ops.multi_layer_kv_transfer(
+                key_value,
+                key_value_ptrs,
+                slot_mapping,
+                torch.device(device),
+                page_buffer_size,
+                lmcache_native.TransferDirection.D2H
+                if direction
+                else lmcache_native.TransferDirection.H2D,
+                hnd_fmt,
+                block_size=block_size,
+                head_size=hnd_hs,
+            )
+            device_sync(device)
+
+            for k in range(hnd_kv):
+                for t_id in range(num_tokens):
+                    s_idx = int(slot_mapping[t_id].item())
+                    for ly in range(num_layers):
+                        torch.testing.assert_close(
+                            key_value[k, ly, t_id].to("cpu"),
+                            token_vec(page_buffers[ly], k, s_idx).to("cpu"),
+                            msg=(
+                                f"Mismatch: HND {hnd_name} {dir_tag} "
+                                f"(tensor_list={use_tensor_list}), k={k}, "
+                                f"layer={ly}, token={t_id}"
+                            ),
+                        )
+            hnd_results[f"multi_layer_kv_transfer_hnd_{hnd_name}_{dir_tag}"] = (
+                key_value.cpu()
+            )
+
+    # HND without head_size cannot be decomposed into heads: refuse, don't guess.
+    if ops is _py_ops:
+        with pytest.raises((ValueError, RuntimeError)):
+            ops.multi_layer_kv_transfer(
+                torch.zeros(
+                    (1, num_layers, num_tokens, hnd_heads * 2 * hnd_hs),
+                    dtype=dtype,
+                    device="cpu",
+                ),
+                page_buffers,
+                slot_mapping,
+                torch.device(device),
+                page_buffer_size,
+                lmcache_native.TransferDirection.H2D,
+                lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
+                block_size=block_size,
+            )
+
+    results.update(hnd_results)
     return results
 
 

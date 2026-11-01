@@ -19,6 +19,52 @@ from lmcache.v1.platform.torch_ops._tensor_from_ptr import (
 )
 
 
+def _hnd_layer_transfer(
+    paged_tensor: torch.Tensor,
+    key_value: torch.Tensor,
+    layer_id: int,
+    valid_mask_kv: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_offsets: torch.Tensor,
+    num_heads: int,
+    row: int,
+    fused: bool,
+    two_major: bool,
+    to_paged: bool,
+) -> None:
+    """Move one layer between an HND paged tensor and the LMCache buffer.
+
+    The paged tensor is [NB, NH, BS, row] (fused K/V), [2, NB, NH, BS, row]
+    (``two_major``) or [NB, 2, NH, BS, row]; ``row`` is the per-head width. The
+    LMCache side is token-major, so a token's scalars are (head, row) flattened.
+    """
+    kv_device = key_value.device
+    paged_device = paged_tensor.device
+    num_valid = int(block_indices.numel())
+
+    def paged_index(k: int | None):
+        if fused:
+            return (block_indices, slice(None), block_offsets)
+        if two_major:
+            return (k, block_indices, slice(None), block_offsets)
+        return (block_indices, k, slice(None), block_offsets)
+
+    # Advanced indices separated by a slice put the indexed dim first, so every
+    # gather below is [num_valid, num_heads, row].
+    for k in range(1 if fused else 2):
+        idx = paged_index(k)
+        if to_paged:
+            src = key_value[k, layer_id, valid_mask_kv, :]
+            paged_tensor[idx] = src.reshape(num_valid, num_heads, row).to(
+                paged_device
+            )
+        else:
+            gathered = paged_tensor[idx]
+            key_value[k, layer_id, valid_mask_kv, :] = gathered.reshape(
+                num_valid, num_heads * row
+            ).to(kv_device, non_blocking=False)
+
+
 def multi_layer_kv_transfer(
     key_value: torch.Tensor,
     key_value_ptrs: torch.Tensor | list[torch.Tensor],
@@ -46,15 +92,27 @@ def multi_layer_kv_transfer(
 
     format_spec = _format_spec(engine_kv_format)
 
-    # TODO: Implement head_size support for HND layouts as next step. Every HND
-    # format needs scalar_offset decomposed into (head_idx, head_offset), fused
-    # or not, so none of them can ride the branches below.
+    # HND pages keep each head's tokens contiguous, so a token's scalars are
+    # block_size rows apart per head. Only the formats vLLM produces for
+    # non-MLA models are supported; head_size splits the flat per-token scalars
+    # into (num_heads, head) rows.
+    hnd_supported = (
+        EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
+        EngineKVFormat.NL_X_NB_NH_BS_CS,
+    )
     if format_spec.is_hnd:
-        raise NotImplementedError(
-            f"HND layouts ({engine_kv_format!r}) are not supported in the "
-            "non-CUDA fallback. head_size parameter is required but not "
-            "implemented in this path."
-        )
+        if engine_kv_format not in hnd_supported:
+            raise NotImplementedError(
+                f"HND layout {engine_kv_format!r} is not supported in the "
+                "non-CUDA fallback; supported HND formats are "
+                f"{[f.name for f in hnd_supported]}."
+            )
+        if head_size <= 0 or block_size <= 0:
+            raise ValueError(
+                f"{engine_kv_format!r} requires head_size > 0 and block_size > 0; "
+                f"got head_size={head_size}, block_size={block_size}."
+            )
 
     # Fused formats pack K and V into the trailing content dim, so the K/V axis
     # of the LMCache-side buffer is 1, not 2 (kv_size == 1, like MLA). A caller
@@ -95,7 +153,8 @@ def multi_layer_kv_transfer(
     # key_value itself.
     is_single_pass = format_spec.is_mla or format_spec.is_fused_packed
     has_interleaved_kv_blocks = (
-        format_spec.is_layer_list
+        not format_spec.is_hnd
+        and format_spec.is_layer_list
         and not format_spec.is_mla
         and not format_spec.is_fused_packed
         and not format_spec.is_two_major
@@ -115,7 +174,26 @@ def multi_layer_kv_transfer(
     # (used when wrapping a raw pointer).
     layer_shape: Tuple[int, ...]
 
-    if is_single_pass:
+    if format_spec.is_hnd:
+        num_blocks = page_buffer_size // block_size
+        # head_size is the real head size; the fused format packs K/V into a
+        # head row of 2 * head_size, the split formats use head_size.
+        row = 2 * head_size if format_spec.is_fused_packed else head_size
+        num_heads = hidden_size // row
+        if num_heads * row != hidden_size:
+            raise ValueError(
+                f"hidden size {hidden_size} is not a multiple of the head row "
+                f"size {row} (head_size={head_size}) for {engine_kv_format!r}"
+            )
+        if format_spec.is_fused_packed:
+            layer_shape = (num_blocks, num_heads, block_size, row)
+        elif format_spec.is_two_major:
+            layer_shape = (2, num_blocks, num_heads, block_size, row)
+        else:
+            layer_shape = (num_blocks, 2, num_heads, block_size, row)
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
+    elif is_single_pass:
         layer_shape = (page_buffer_size, hidden_size)
     elif has_interleaved_kv_blocks:
         num_blocks = page_buffer_size // block_size
@@ -136,7 +214,21 @@ def multi_layer_kv_transfer(
             )
 
         # --- B. Vectorized bulk data transfer. ---
-        if is_single_pass:
+        if format_spec.is_hnd:
+            _hnd_layer_transfer(
+                paged_tensor,
+                key_value,
+                layer_id,
+                valid_mask_kv,
+                block_indices,
+                block_offsets,
+                num_heads,
+                row,
+                fused=format_spec.is_fused_packed,
+                two_major=format_spec.is_two_major,
+                to_paged=int(direction) == int(TransferDirection.H2D),
+            )
+        elif is_single_pass:
             # MLA / fused packed K+V.
             # Paged layout : [page_buffer_size, hidden_size]
             # key_value layout: [1, num_layers, num_tokens, hidden_size]

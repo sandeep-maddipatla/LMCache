@@ -529,6 +529,27 @@ def check_paged_kv_cache_equal(
             assert left_kv.shape[0] >= num_tokens
             assert (left_kv[slot_mapping, :, :] == right_kv[slot_mapping, :, :]).all()
 
+    elif engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS:
+        # HND with K/V fused into the trailing content dim:
+        #   [num_blocks, num_heads, block_size, 2 * head_size]
+        # Move heads behind block_size so the block dims flatten to token order.
+        num_tokens = slot_mapping.shape[0]
+        content_size = 2 * head_size
+        for left_kv_layer, right_kv_layer in zip(left, right, strict=False):
+            left_kv = (
+                left_kv_layer.permute(0, 2, 1, 3)
+                .contiguous()
+                .reshape(-1, num_heads, content_size)
+            )
+            right_kv = (
+                right_kv_layer.permute(0, 2, 1, 3)
+                .contiguous()
+                .reshape(-1, num_heads, content_size)
+            )
+
+            assert left_kv.shape[0] >= num_tokens
+            assert (left_kv[slot_mapping, :, :] == right_kv[slot_mapping, :, :]).all()
+
     else:
         # Without this the function would silently compare nothing and every
         # caller passing an unhandled format would pass vacuously.

@@ -18,6 +18,7 @@ from lmcache.v1.gpu_connector.utils import (
     assert_is_vllm_flash_attn_or_flash_infer,
     get_block_size,
     get_elements_per_layer,
+    get_head_size,
     get_num_blocks,
     get_tokens_per_layer,
     normalize_kv_and_discover_format,
@@ -64,6 +65,23 @@ def _as_fused_plane(
     return tensor.view(1, tensor.size(1), tensor.size(2), 2 * tensor.size(3))
 
 
+def _kernel_head_size(
+    kv_caches, engine_kv_format: lmcache_native.EngineKVFormat
+) -> int:
+    """Real head size, in elements, as the transfer kernel's ``head_size``.
+
+    HND pages interleave heads by block row, so the kernel splits each token's
+    scalars into heads with it. A fused format reports its per-head content size
+    (``2 * head_size``, K/V packed), while the kernel takes the real head size
+    and doubles it for fused formats, as the CUDA kernel does. NHD and MLA
+    formats ignore the value.
+    """
+    head_size = get_head_size(kv_caches, engine_kv_format)
+    if get_spec_class(engine_kv_format).is_fused_packed:
+        return head_size // 2
+    return head_size
+
+
 class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
     """
     The GPU KV cache should be a nested tuple of K and V tensors.
@@ -97,6 +115,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         # works with a single device?
         self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
         self.page_buffer_size = 0
+        self.head_size = 0
 
         self.kvcaches: Optional[List[torch.Tensor]] = None
 
@@ -177,6 +196,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         self.num_blocks = get_num_blocks(kv_caches, self.engine_kv_format)
         self.block_size = get_block_size(kv_caches, self.engine_kv_format)
         self.page_buffer_size = self.num_blocks * self.block_size
+        self.head_size = _kernel_head_size(kv_caches, self.engine_kv_format)
 
         return self.kv_cache_pointers_on_gpu[idx]
 
@@ -243,6 +263,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
             lmcache_native.TransferDirection.H2D,
             self.engine_kv_format,
             block_size=self.block_size,
+            head_size=self.head_size,
             skip_prefix_n_tokens=skip_prefix_n_tokens,
         )
 
@@ -290,6 +311,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
                     lmcache_native.TransferDirection.D2H,
                     self.engine_kv_format,
                     block_size=self.block_size,
+                    head_size=self.head_size,
                 )
             else:
                 # kvcaches -> gpu_buffer -> memobj
@@ -304,6 +326,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
                     lmcache_native.TransferDirection.D2H,
                     self.engine_kv_format,
                     block_size=self.block_size,
+                    head_size=self.head_size,
                 )
                 memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
@@ -350,6 +373,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         self.use_gpu = use_gpu
         self.kvcaches: Optional[List[torch.Tensor]] = None
         self.page_buffer_size = 0
+        self.head_size = 0
 
         self.init = False
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
@@ -408,6 +432,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         self.num_blocks = get_num_blocks(self.kvcaches, self.engine_kv_format)
         self.block_size = get_block_size(self.kvcaches, self.engine_kv_format)
         self.page_buffer_size = self.num_blocks * self.block_size
+        self.head_size = _kernel_head_size(self.kvcaches, self.engine_kv_format)
 
         self.init = True
         logger.info("init kv cache pointers success in VLLMPagedMemXPUConnectorV3")
@@ -445,8 +470,9 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
                 self.page_buffer_size,
                 lmcache_native.TransferDirection.H2D,
                 self.engine_kv_format,
-                self.block_size,
-                skip_prefix_n_tokens,
+                block_size=self.block_size,
+                head_size=self.head_size,
+                skip_prefix_n_tokens=skip_prefix_n_tokens,
             )
 
     @_lmcache_nvtx_annotate
@@ -475,7 +501,8 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
                         self.page_buffer_size,
                         lmcache_native.TransferDirection.D2H,
                         self.engine_kv_format,
-                        self.block_size,
+                        block_size=self.block_size,
+                        head_size=self.head_size,
                     )
             else:
                 # kvcaches -> gpu_buffer -> memobj
@@ -492,7 +519,8 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
                         self.page_buffer_size,
                         lmcache_native.TransferDirection.D2H,
                         self.engine_kv_format,
-                        self.block_size,
+                        block_size=self.block_size,
+                        head_size=self.head_size,
                     )
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
