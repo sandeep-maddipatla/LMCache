@@ -61,8 +61,6 @@ class SyclProfile(BuildProfile):
                     "cxx": [
                         "-D_GLIBCXX_USE_CXX11_ABI=1",
                         "-O3",
-                        # torch 2.14 headers (vLLM 0.31+ on XPU) need C++20.
-                        "-std=c++20",
                         "-fsycl",
                         "-fno-sycl-id-queries-fit-in-int",
                         "-ffast-math",
